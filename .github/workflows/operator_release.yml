@@ -65,12 +65,12 @@ jobs:
         run: make build-installer IMG=${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}
 
       - name: Attach installer to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: operator/dist/install.yaml
 
       - name: Update latest release alias
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: operator-latest
           name: "Operator Latest (${{ steps.version.outputs.VERSION }})"
