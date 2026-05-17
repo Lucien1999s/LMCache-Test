@@ -1,0 +1,11 @@
+lmcache 0.4.6.dev6
+vllm 0.18.0+cu130
+torch 2.10.0+cu130
+transformers 5.8.1
+numpy 2.2.6
+flashinfer-python 0.6.6
+torch cuda: 13.0
+cuda available: True
+gpu: NVIDIA A100-SXM4-40GB
+lmcache file: /home/exouser/projects/LMCache/.venv-lmcache-nightly/lib/python3.12/site-packages/lmcache/__init__.py
+vllm file: /home/exouser/projects/LMCache/.venv-lmcache-nightly/lib/python3.12/site-packages/vllm/__init__.py

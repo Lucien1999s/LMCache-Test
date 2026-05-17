@@ -146,3 +146,13 @@ operator/Dockerfile.cross
 
 # Compiled gettext catalogs (built from .po at HTML build time)
 docs/source/locale/**/*.mo
+
+# ContextFlow local experiment artifacts
+.venv-lmcache-nightly/
+.venv*/
+__pycache__/
+*.pyc
+results/
+logs/
+*.jsonl
+*.log
