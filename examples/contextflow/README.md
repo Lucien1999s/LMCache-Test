@@ -20,3 +20,30 @@ Run a controlled chunk-scaling diagnostic for LMCache CacheBlend:
 - chunk counts: 2, 4, 8, 16
 - model: Qwen2.5
 - metrics: latency, TTFT-style timing, output tokens, prompt tokens, GPU memory, success/failure
+
+## Rebuild the verified environment
+
+From the repository root:
+
+    bash examples/contextflow/setup_cacheblend_env.sh
+
+To force a clean rebuild:
+
+    RESET_ENV=1 bash examples/contextflow/setup_cacheblend_env.sh
+
+To rebuild and run a small official CacheBlend smoke test:
+
+    RUN_SMOKE=1 bash examples/contextflow/setup_cacheblend_env.sh
+
+After setup:
+
+    source .venv-lmcache-nightly/bin/activate
+    cd ~/projects
+    python LMCache/examples/blend_kv_v1/blend.py --model Qwen/Qwen2.5-0.5B-Instruct
+    python LMCache/examples/blend_kv_v1/blend.py --model Qwen/Qwen2.5-7B-Instruct
+
+## Current status
+
+The official LMCache CacheBlend path has been validated on Qwen2.5-0.5B and Qwen2.5-7B on A100 after applying the two compatibility patches above.
+
+The next step is to adapt `contextflow_lmcache_chunk_sweep.py` into a controlled chunk-scaling diagnostic runner.
