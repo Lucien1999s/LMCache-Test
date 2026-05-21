@@ -42,6 +42,11 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
+from lmcache.v1.contextflow_profiler import (
+    record_event as cf_record_event,
+    span as cf_span,
+    start_span as cf_start_span,
+)
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -734,6 +739,43 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._manager.post_init()
 
+    def _advance_layerwise_storer(
+        self,
+        layerwise_storer: Generator[Optional[torch.Tensor], None, None],
+        *,
+        stage: str,
+        request_id: str,
+        layer_name: Optional[str] = None,
+        allow_exhausted: bool = False,
+    ) -> bool:
+        timer = cf_start_span(
+            stage,
+            category="worker",
+            device="GPU->CPU/CPU",
+            request_id=request_id,
+            metadata={"layer_name": layer_name} if layer_name is not None else None,
+        )
+        try:
+            next(layerwise_storer)
+        except StopIteration:
+            timer.finish(exhausted=True)
+            cf_record_event(
+                f"{stage}_exhausted",
+                category="worker",
+                device="GPU->CPU/CPU",
+                request_id=request_id,
+                metadata={"layer_name": layer_name},
+            )
+            if allow_exhausted:
+                return False
+            raise
+        except Exception as exc:
+            timer.finish(exception=repr(exc))
+            raise
+        else:
+            timer.finish(exhausted=False)
+            return True
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -807,13 +849,26 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    )
+                    with cf_span(
+                        "cacheblend_load_recompute_repair_writeback",
+                        category="worker",
+                        device="CPU/GPU",
+                        request_id=request.req_id,
+                        metadata={
+                            "lmcache_cached_tokens": lmcache_cached_tokens,
+                            "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                            "tokens_to_load": int(token_mask.sum().item()),
+                            "request_tokens": len(tokens),
+                        },
+                    ):
+                        self.blender.blend(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            req_id=request.req_id,
+                        )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
@@ -821,6 +876,7 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        req_id=request.req_id,
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
@@ -1067,7 +1123,13 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            next(layerwise_storer)
+            self._advance_layerwise_storer(
+                layerwise_storer,
+                stage="kv_cache_store_layer_step",
+                request_id=request.req_id,
+                layer_name=layer_name,
+                allow_exhausted=True,
+            )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -1094,7 +1156,12 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    self._advance_layerwise_storer(
+                        layerwise_storer,
+                        stage="kv_cache_store_finalize",
+                        request_id=request.req_id,
+                        allow_exhausted=True,
+                    )
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return
@@ -1349,9 +1416,19 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
-        if (
-            num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
-        ) != -1:
+        with cf_span(
+            "later_request_lookup_cache_check",
+            category="scheduler",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "prompt_tokens": request.num_tokens,
+                "vllm_cached_tokens": num_computed_tokens,
+            },
+        ):
+            num_external_hit_tokens = self.lookup_client.lookup_cache(lookup_id=req_id)
+
+        if num_external_hit_tokens != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
             logger.debug(
@@ -1378,11 +1455,21 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids,
-                lookup_id=req_id,
-                request_configs=request_configs,
-            )
+            with cf_span(
+                "later_request_cache_lookup",
+                category="scheduler",
+                device="CPU",
+                request_id=req_id,
+                metadata={
+                    "input_tokens": len(token_ids),
+                    "vllm_cached_tokens": num_computed_tokens,
+                },
+            ):
+                num_external_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                )
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1439,6 +1526,20 @@ class LMCacheConnectorV1Impl:
             can_load=False,
         )
 
+        cf_record_event(
+            "later_request_cache_lookup_result",
+            category="scheduler",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "prompt_tokens": request.num_tokens,
+                "vllm_cached_tokens": num_computed_tokens,
+                "lmcache_cached_tokens": num_external_hit_tokens,
+                "need_to_allocate": max(need_to_allocate, 0),
+                "below_min_retrieve": below_min_retrieve,
+            },
+        )
+
         if below_min_retrieve or need_to_allocate <= 0:
             return 0
 
@@ -1489,11 +1590,33 @@ class LMCacheConnectorV1Impl:
 
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
+            cf_record_event(
+                "kv_slot_allocation_result",
+                category="scheduler",
+                device="CPU",
+                request_id=request.request_id,
+                metadata={
+                    "num_external_tokens": num_external_tokens,
+                    "can_load": False,
+                    "reason": "no_load_spec",
+                },
+            )
             return
 
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            cf_record_event(
+                "kv_slot_allocation_result",
+                category="scheduler",
+                device="CPU",
+                request_id=request.request_id,
+                metadata={
+                    "num_external_tokens": num_external_tokens,
+                    "can_load": False,
+                    "reason": "zero_external_tokens",
+                },
+            )
             return
 
         recalc_last = (
@@ -1521,6 +1644,22 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
+        cf_record_event(
+            "kv_slot_allocation_result",
+            category="scheduler",
+            device="CPU",
+            request_id=request.request_id,
+            metadata={
+                "num_external_tokens": num_external_tokens,
+                "can_load": True,
+                "lmcache_cached_tokens": self.load_specs[
+                    request.request_id
+                ].lmcache_cached_tokens,
+                "vllm_cached_tokens": self.load_specs[
+                    request.request_id
+                ].vllm_cached_tokens,
+            },
+        )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(

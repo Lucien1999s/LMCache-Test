@@ -20,11 +20,17 @@ import argparse
 import contextlib
 import json
 import os
+import sys
 import threading
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pynvml
 from transformers import AutoTokenizer
@@ -34,6 +40,11 @@ from vllm.engine.arg_utils import EngineArgs
 
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.v1.contextflow_profiler import (
+    configure as configure_contextflow_profiler,
+    record_event as cf_record_event,
+    span as cf_span,
+)
 
 
 LMCACHE_ENV_KEYS = [
@@ -60,9 +71,11 @@ def setup_common_env() -> None:
     os.environ.setdefault("HF_HOME", os.path.expanduser("~/hf-cache"))
     os.environ.setdefault("HF_HUB_CACHE", os.path.expanduser("~/hf-cache/hub"))
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("TMPDIR", "/tmp/cf")
-    os.environ.setdefault("TMP", "/tmp/cf")
-    os.environ.setdefault("TEMP", "/tmp/cf")
+    # Force short tmp paths for LMCache ZMQ IPC sockets.
+    # Long TMPDIR paths can exceed sockaddr_un.sun_path and break lookup_client init.
+    os.environ["TMPDIR"] = "/tmp/cf"
+    os.environ["TMP"] = "/tmp/cf"
+    os.environ["TEMP"] = "/tmp/cf"
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     os.environ.pop("VLLM_ATTENTION_BACKEND", None)
     Path("/tmp/cf").mkdir(parents=True, exist_ok=True)
@@ -73,6 +86,7 @@ def setup_lmcache_blend_env(
     recompute_ratio: float,
     chunk_size: int = 256,
     use_disk: bool = False,
+    enable_sparse: bool = False,
 ) -> None:
     clear_lmcache_env()
 
@@ -82,6 +96,10 @@ def setup_lmcache_blend_env(
     os.environ["LMCACHE_USE_LAYERWISE"] = "True"
     os.environ["LMCACHE_BLEND_CHECK_LAYERS"] = "1"
     os.environ["LMCACHE_BLEND_RECOMPUTE_RATIOS"] = str(recompute_ratio)
+
+    if enable_sparse:
+        os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+        os.environ["LMCACHE_EXTRA_CONFIG"] = '{"enable_sparse": true}'
 
     if use_disk:
         os.environ["LMCACHE_LOCAL_CPU"] = "False"
@@ -247,29 +265,120 @@ def build_prompts(
     }
 
 
-def generate_once(llm: LLM, prompt_ids: list[int], max_new_tokens: int) -> tuple[str, float, int]:
+def _request_metrics_to_dict(metrics: Any) -> dict[str, Any]:
+    if metrics is None:
+        return {}
+    keys = [
+        "arrival_time",
+        "queued_ts",
+        "scheduled_ts",
+        "first_token_ts",
+        "last_token_ts",
+        "first_token_latency",
+        "num_generation_tokens",
+    ]
+    values = {key: getattr(metrics, key, None) for key in keys}
+    scheduled_ts = values.get("scheduled_ts") or 0.0
+    first_token_ts = values.get("first_token_ts") or 0.0
+    last_token_ts = values.get("last_token_ts") or 0.0
+    if scheduled_ts and first_token_ts:
+        values["prefill_time"] = first_token_ts - scheduled_ts
+    if first_token_ts and last_token_ts:
+        values["decode_time"] = last_token_ts - first_token_ts
+    if scheduled_ts and last_token_ts:
+        values["inference_time"] = last_token_ts - scheduled_ts
+    return values
+
+
+def generate_once(
+    llm: LLM,
+    prompt_ids: list[int],
+    max_new_tokens: int,
+    request_label: str,
+) -> tuple[str, float, int, dict[str, Any]]:
     params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_new_tokens)
-    start = time.time()
-    outputs = llm.generate(
-        prompts={"prompt_token_ids": prompt_ids},
-        sampling_params=params,
-    )
-    elapsed = time.time() - start
+    with cf_span(
+        "offline_llm_generate_call",
+        category="runner",
+        device="CPU/GPU",
+        metadata={
+            "request_label": request_label,
+            "prompt_tokens": len(prompt_ids),
+            "max_new_tokens": max_new_tokens,
+        },
+    ):
+        start = time.time()
+        outputs = llm.generate(
+            prompts={"prompt_token_ids": prompt_ids},
+            sampling_params=params,
+        )
+        elapsed = time.time() - start
     text = outputs[0].outputs[0].text
     output_tokens = len(outputs[0].outputs[0].token_ids)
-    return text, elapsed, output_tokens
+    metrics = _request_metrics_to_dict(getattr(outputs[0], "metrics", None))
+    cf_record_event(
+        "vllm_request_metrics",
+        category="runner",
+        device="CPU/GPU",
+        metadata={
+            "request_label": request_label,
+            "prompt_tokens": len(prompt_ids),
+            "max_new_tokens": max_new_tokens,
+            "output_tokens": output_tokens,
+            "num_cached_tokens": getattr(outputs[0], "num_cached_tokens", None),
+            "metrics": metrics,
+        },
+    )
+    return text, elapsed, output_tokens, metrics
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     setup_common_env()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    prompts = build_prompts(
-        tokenizer=tokenizer,
-        chunk_count=args.chunk_count,
-        chunk_size_tokens=args.chunk_size_tokens,
-        blend_special_str=args.blend_special_str,
-    )
+    if args.stage_profile_output:
+        condition = {
+            "method": args.method,
+            "model": args.model,
+            "chunk_count": args.chunk_count,
+            "chunk_size_tokens": args.chunk_size_tokens,
+            "max_new_tokens": args.max_new_tokens,
+            "recompute_ratio": args.recompute_ratio,
+            "lmcache_chunk_size": args.lmcache_chunk_size,
+            "enable_sparse": args.enable_sparse,
+        }
+        if args.stage_profile_reset_output:
+            Path(args.stage_profile_output).unlink(missing_ok=True)
+        configure_contextflow_profiler(
+            args.stage_profile_output,
+            enabled=True,
+            cuda_sync=args.stage_profile_cuda_sync,
+            include_memory=not args.stage_profile_no_memory,
+            run_id=args.stage_profile_run_id or str(uuid.uuid4()),
+            condition=condition,
+        )
+
+    with cf_span(
+        "prompt_tokenizer_load",
+        category="runner",
+        device="CPU",
+        metadata={"model": args.model},
+    ):
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+    with cf_span(
+        "prompt_build_and_tokenize",
+        category="runner",
+        device="CPU",
+        metadata={
+            "chunk_count": args.chunk_count,
+            "chunk_size_tokens": args.chunk_size_tokens,
+        },
+    ):
+        prompts = build_prompts(
+            tokenizer=tokenizer,
+            chunk_count=args.chunk_count,
+            chunk_size_tokens=args.chunk_size_tokens,
+            blend_special_str=args.blend_special_str,
+        )
 
     result: dict[str, Any] = {
         "method": args.method,
@@ -297,6 +406,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 recompute_ratio=args.recompute_ratio,
                 chunk_size=args.lmcache_chunk_size,
                 use_disk=args.use_disk,
+                enable_sparse=args.enable_sparse,
             )
             context = build_lmcache_llm(
                 model=args.model,
@@ -314,23 +424,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(f"Unknown method: {args.method}")
 
         with context as llm:
-            _, warmup_sec, _ = generate_once(llm, prompts["warmup"], 1)
+            _, warmup_sec, _, warmup_metrics = generate_once(
+                llm, prompts["warmup"], 1, "warmup"
+            )
 
             if args.method == "lmcache_blend":
-                _, first_sec, _ = generate_once(llm, prompts["first"], 1)
+                _, first_sec, _, first_metrics = generate_once(
+                    llm, prompts["first"], 1, "first_store"
+                )
                 time.sleep(args.sleep_between_requests)
-                _, second_sec, _ = generate_once(llm, prompts["second"], 1)
+                _, second_sec, _, second_metrics = generate_once(
+                    llm, prompts["second"], 1, "second_blend_warmup"
+                )
                 time.sleep(args.sleep_between_requests)
                 measured_prompt = prompts["third"]
             else:
                 first_sec = None
                 second_sec = None
+                first_metrics = None
+                second_metrics = None
                 measured_prompt = prompts["third"]
 
-            output_text, generation_sec, output_tokens = generate_once(
+            output_text, generation_sec, output_tokens, generation_metrics = generate_once(
                 llm,
                 measured_prompt,
                 args.max_new_tokens,
+                "measured",
             )
 
         result.update(
@@ -340,8 +459,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "first_sec": first_sec,
                 "second_sec": second_sec,
                 "generation_sec": generation_sec,
+                "warmup_metrics": warmup_metrics,
+                "first_metrics": first_metrics,
+                "second_metrics": second_metrics,
+                "generation_metrics": generation_metrics,
                 "output_tokens": output_tokens,
                 "output_text": output_text,
+                "stage_profile_output": args.stage_profile_output,
             }
         )
 
@@ -378,7 +502,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recompute-ratio", type=float, default=0.15)
     parser.add_argument("--lmcache-chunk-size", type=int, default=256)
     parser.add_argument("--use-disk", action="store_true")
+    parser.add_argument("--enable-sparse", action="store_true")
     parser.add_argument("--sleep-between-requests", type=float, default=1.0)
+
+    parser.add_argument("--stage-profile-output", default=None)
+    parser.add_argument("--stage-profile-run-id", default=None)
+    parser.add_argument("--stage-profile-cuda-sync", action="store_true")
+    parser.add_argument("--stage-profile-no-memory", action="store_true")
+    parser.add_argument("--stage-profile-reset-output", action="store_true")
 
     parser.add_argument("--output", required=True)
 

@@ -35,6 +35,7 @@ run_one () {
   rm -rf /tmp/cf/*
   mkdir -p /tmp/cf
 
+  TMPDIR=/tmp/cf TMP=/tmp/cf TEMP=/tmp/cf \
   python examples/contextflow/contextflow_lmcache_single_run.py \
     --method "$method" \
     --model "$MODEL" \
@@ -49,11 +50,9 @@ run_one () {
 
 for c in $CHUNK_COUNTS; do
   run_one "full_recompute_ttft_proxy" "full_recompute" "0.0" "$c" "1"
-  run_one "lmcache_reuse_proxy_ttft_proxy" "lmcache_blend" "0.0" "$c" "1"
   run_one "lmcache_selective_ttft_proxy" "lmcache_blend" "0.15" "$c" "1"
 
   run_one "full_recompute_e2e_16tok" "full_recompute" "0.0" "$c" "16"
-  run_one "lmcache_reuse_proxy_e2e_16tok" "lmcache_blend" "0.0" "$c" "16"
   run_one "lmcache_selective_e2e_16tok" "lmcache_blend" "0.15" "$c" "16"
 done
 

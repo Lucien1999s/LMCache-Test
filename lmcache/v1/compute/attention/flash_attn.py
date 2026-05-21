@@ -3,7 +3,10 @@
 from typing import TYPE_CHECKING
 
 # Third Party
-from vllm.attention import Attention
+try:
+    from vllm.attention import Attention
+except ModuleNotFoundError:
+    from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
 import torch
@@ -12,6 +15,7 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.compute.attention.abstract import AttentionInterface
 from lmcache.v1.compute.attention.metadata import LMCFlashAttnMetadata
+from lmcache.v1.contextflow_profiler import span as cf_span
 
 if TYPE_CHECKING:
     # First Party
@@ -48,6 +52,7 @@ class LMCFlashAttnBackend(AttentionInterface):
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(attn_metadata, LMCFlashAttnMetadata)
+        layer_id = kwargs.get("layer_id")
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -68,28 +73,41 @@ class LMCFlashAttnBackend(AttentionInterface):
             causal=True,  # Assuming causal attention
         )
 
-        flash_attn_varlen_func(
-            q=query,  # contiguous
-            k=key,  # contiguous
-            v=value,  # contiguous
-            out=output,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            cu_seqlens_k=cu_seqlens_k,
-            # seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.vllm_attn_impl.scale,
-            causal=True,
-            alibi_slopes=self.vllm_attn_impl.alibi_slopes,
-            window_size=self.vllm_attn_impl.sliding_window,
-            block_table=None,
-            softcap=self.vllm_attn_impl.logits_soft_cap,
-            scheduler_metadata=scheduler_metadata,
-            fa_version=self.vllm_attn_impl.vllm_flash_attn_version,
-            q_descale=self.vllm_attn._q_scale.expand(descale_shape),
-            k_descale=self.vllm_attn._k_scale.expand(descale_shape),
-            v_descale=self.vllm_attn._v_scale.expand(descale_shape),
-        )
+        with cf_span(
+            "selected_token_attention_repair",
+            category="attention",
+            device="GPU",
+            layer_id=layer_id,
+            metadata={
+                "query_tokens": query.shape[0],
+                "kv_tokens": key.shape[0],
+                "heads": query.shape[1],
+                "head_dim": query.shape[2],
+                "backend": "flash_attn",
+            },
+        ):
+            flash_attn_varlen_func(
+                q=query,  # contiguous
+                k=key,  # contiguous
+                v=value,  # contiguous
+                out=output,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_seqlens_k,
+                # seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.vllm_attn_impl.scale,
+                causal=True,
+                alibi_slopes=self.vllm_attn_impl.alibi_slopes,
+                window_size=self.vllm_attn_impl.sliding_window,
+                block_table=None,
+                softcap=self.vllm_attn_impl.logits_soft_cap,
+                scheduler_metadata=scheduler_metadata,
+                fa_version=self.vllm_attn_impl.vllm_flash_attn_version,
+                q_descale=self.vllm_attn._q_scale.expand(descale_shape),
+                k_descale=self.vllm_attn._k_scale.expand(descale_shape),
+                v_descale=self.vllm_attn._v_scale.expand(descale_shape),
+            )
 
         return output
 

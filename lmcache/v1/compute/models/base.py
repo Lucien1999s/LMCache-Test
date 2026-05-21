@@ -10,6 +10,7 @@ import torch
 from lmcache import torch_device_type
 from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
 from lmcache.v1.compute.positional_encoding import get_fused_rope
+from lmcache.v1.contextflow_profiler import span as cf_span
 
 # TODO(Jiayi): A few things need to be tested/supported:
 # TP, PP, Multimodal
@@ -102,27 +103,36 @@ class LMCBaseModel(nn.Module, ABC):
             # TODO(Jiayi) The last layer doesn't have to be computed
             # hidden_states, residual = layer(positions, hidden_states, residual)
 
-            # Self Attention
-            if residual is None:
-                residual = hidden_states
-                hidden_states = layer.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-            # hidden_states = self.self_attn(positions=positions,
-            #                            hidden_states=hidden_states)
+            with cf_span(
+                "layernorm_qkv_proj",
+                category="model",
+                device="GPU",
+                layer_id=idx,
+                metadata={"tokens": input_ids.shape[0]},
+            ):
+                # Self Attention
+                if residual is None:
+                    residual = hidden_states
+                    hidden_states = layer.input_layernorm(hidden_states)
+                else:
+                    hidden_states, residual = layer.input_layernorm(
+                        hidden_states, residual
+                    )
+                # hidden_states = self.self_attn(positions=positions,
+                #                            hidden_states=hidden_states)
 
-            qkv, _ = layer.self_attn.qkv_proj(hidden_states)
-            q, k, v = qkv.split(
-                [
-                    layer.self_attn.q_size,
-                    layer.self_attn.kv_size,
-                    layer.self_attn.kv_size,
-                ],
-                dim=-1,
-            )
+                qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+                q, k, v = qkv.split(
+                    [
+                        layer.self_attn.q_size,
+                        layer.self_attn.kv_size,
+                        layer.self_attn.kv_size,
+                    ],
+                    dim=-1,
+                )
 
-            # Model-specific QKV processing
-            q, k, v = self._process_qkv(q, k, v, layer)
+                # Model-specific QKV processing
+                q, k, v = self._process_qkv(q, k, v, layer)
 
             q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
                 q, k, v, residual, idx, attn_output, attn_metadata
@@ -138,19 +148,26 @@ class LMCBaseModel(nn.Module, ABC):
             attn_output = attn_output.view(-1, num_heads, head_size)
 
             attn_output = self.lmc_attn_layers[idx].forward_contiguous(
-                q, k, v, attn_output, attn_metadata
+                q, k, v, attn_output, attn_metadata, layer_id=idx
             )
 
-            attn_output = attn_output.view(-1, num_heads * head_size)
-            k = k.view(-1, num_kv_heads * head_size)
-            v = v.view(-1, num_kv_heads * head_size)
+            with cf_span(
+                "post_attention_mlp",
+                category="model",
+                device="GPU",
+                layer_id=idx,
+                metadata={"tokens": input_ids.shape[0]},
+            ):
+                attn_output = attn_output.view(-1, num_heads * head_size)
+                k = k.view(-1, num_kv_heads * head_size)
+                v = v.view(-1, num_kv_heads * head_size)
 
-            hidden_states, _ = layer.self_attn.o_proj(attn_output)
+                hidden_states, _ = layer.self_attn.o_proj(attn_output)
 
-            # Fully Connected
-            hidden_states, residual = layer.post_attention_layernorm(
-                hidden_states, residual
-            )
-            hidden_states = layer.mlp(hidden_states)
+                # Fully Connected
+                hidden_states, residual = layer.post_attention_layernorm(
+                    hidden_states, residual
+                )
+                hidden_states = layer.mlp(hidden_states)
 
             yield

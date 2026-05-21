@@ -40,6 +40,10 @@ from lmcache.utils import (
     convert_tokens_to_list,
 )
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.contextflow_profiler import (
+    record_event as cf_record_event,
+    span as cf_span,
+)
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
@@ -642,67 +646,87 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
+        with cf_span(
+            "store_cache_key_generation_and_cpu_allocation",
+            category="cache_engine",
+            device="CPU",
+            request_id=req_id,
+            metadata={"input_tokens": len(tokens), "tokens_to_store": num_to_store_tokens},
         ):
-            assert isinstance(key, CacheEngineKey)
-
-            keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens, mask=mask, request_configs=request_configs
             ):
-                continue
+                assert isinstance(key, CacheEngineKey)
 
-            # Allocate the memory object
-            num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+                keys_multi_layer = key.split_layers(self.num_layers)
+                # Only check the first layer
+                if self.storage_manager.contains(
+                    keys_multi_layer[0], self.retrieve_locations
+                ):
+                    continue
 
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
-            )
+                # Allocate the memory object
+                num_tokens = end - start
+                kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
-            if memory_objs_multi_layer is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=self.fmt,
+                    busy_loop=self.config.get_extra_config_value(
+                        "force_store_wait", False
+                    ),
                 )
-                break
 
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
-            memory_objs.append(memory_objs_multi_layer)
-            tot_token_num += num_tokens
-
-            # Create KV event
-            if self.kv_events_enabled and tokens is not None:
-                stored_event = CacheStoreEvent(
-                    block_hashes=[key.chunk_hash],
-                    parent_block_hash=None if start == 0 else prev_key,
-                    token_ids=[],
-                    block_size=num_tokens,
-                    lora_id=None,
-                    medium="cpu",
-                    lora_name=None,
-                )
-                if tokens is not None:
-                    stored_event.token_ids = convert_tokens_to_list(
-                        tokens,
-                        start,
-                        end,
+                if memory_objs_multi_layer is None:
+                    logger.warning(
+                        "Local cpu memory under pressure so"
+                        " choosing to not store the KV cache."
                     )
-                    if isinstance(tokens, torch.Tensor):
-                        stored_event.medium = tokens.device
-                logger.debug(
-                    f"Added kv cache event '{stored_event}' to kv cache events queue"
-                )
-                self.kv_events.append(stored_event)
-                prev_key = key.chunk_hash
+                    break
+
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
+                memory_objs.append(memory_objs_multi_layer)
+                tot_token_num += num_tokens
+
+                # Create KV event
+                if self.kv_events_enabled and tokens is not None:
+                    stored_event = CacheStoreEvent(
+                        block_hashes=[key.chunk_hash],
+                        parent_block_hash=None if start == 0 else prev_key,
+                        token_ids=[],
+                        block_size=num_tokens,
+                        lora_id=None,
+                        medium="cpu",
+                        lora_name=None,
+                    )
+                    if tokens is not None:
+                        stored_event.token_ids = convert_tokens_to_list(
+                            tokens,
+                            start,
+                            end,
+                        )
+                        if isinstance(tokens, torch.Tensor):
+                            stored_event.medium = tokens.device
+                    logger.debug(
+                        f"Added kv cache event '{stored_event}' to kv cache events queue"
+                    )
+                    self.kv_events.append(stored_event)
+                    prev_key = key.chunk_hash
+
+        cf_record_event(
+            "store_cache_key_generation_result",
+            category="cache_engine",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "segments_to_store": len(starts),
+                "tokens_to_store_after_dedup": tot_token_num,
+            },
+        )
 
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -721,14 +745,39 @@ class LMCacheEngine:
                 memory_objs, starts, ends, **kwargs
             )
 
-            next(mem_obj_generator)
+            with cf_span(
+                "kv_store_gpu_to_cpu_prepare",
+                category="cache_engine",
+                device="GPU->CPU",
+                request_id=req_id,
+                metadata={"segments": len(starts), "tokens": tot_token_num},
+            ):
+                next(mem_obj_generator)
 
             for layer_id in range(self.num_layers):
                 yield
-                next(mem_obj_generator)
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
-                )
+                with cf_span(
+                    "kv_store_gpu_to_cpu_layer",
+                    category="cache_engine",
+                    device="GPU->CPU",
+                    request_id=req_id,
+                    layer_id=layer_id,
+                    metadata={"segments": len(starts), "tokens": tot_token_num},
+                ):
+                    next(mem_obj_generator)
+                with cf_span(
+                    "kv_store_cpu_backend_put_layer",
+                    category="cache_engine",
+                    device="CPU",
+                    request_id=req_id,
+                    layer_id=layer_id,
+                    metadata={"segments": len(starts), "tokens": tot_token_num},
+                ):
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        location=self.store_location,
+                    )
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -964,36 +1013,58 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
+        with cf_span(
+            "retrieve_cache_key_generation_and_hit_check",
+            category="cache_engine",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "input_tokens": len(tokens),
+                "required_tokens": num_required_tokens,
+            },
         ):
-            assert isinstance(key, CacheEngineKey)
-
-            keys_multi_layer = key.split_layers(self.num_layers)
-
-            # NOTE: Only check the first layer
-            if current_location := self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
             ):
-                if location is None:
-                    location = current_location
+                assert isinstance(key, CacheEngineKey)
+
+                keys_multi_layer = key.split_layers(self.num_layers)
+
+                # NOTE: Only check the first layer
+                if current_location := self.storage_manager.contains(
+                    keys_multi_layer[0], self.retrieve_locations
+                ):
+                    if location is None:
+                        location = current_location
+                    else:
+                        # TODO(Jiayi): Support multi-location retrieval in the future
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval."
+                            "Please support multi-location retrieval in the future."
+                        )
                 else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
-                    )
-            else:
-                break
+                    break
 
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
 
-            ret_mask[start:end] = True
+                ret_mask[start:end] = True
+
+        cf_record_event(
+            "retrieve_cache_key_generation_result",
+            category="cache_engine",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "segments_to_retrieve": len(starts),
+                "tokens_to_retrieve": int(torch.sum(ret_mask).item()),
+                "location": location,
+            },
+        )
 
         if keys:
             # Transpose the keys into layer major format
@@ -1007,11 +1078,26 @@ class LMCacheEngine:
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+            with cf_span(
+                "cached_kv_load_preparation",
+                category="cache_engine",
+                device="CPU/GPU",
+                request_id=req_id,
+                metadata={"segments": len(starts), "location": location},
+            ):
+                next(mem_obj_consumer)
 
             to_count_down = []
             for layer_id in range(self.num_layers):
-                task = next(get_generator)
+                with cf_span(
+                    "cached_kv_cpu_backend_get_submit_layer",
+                    category="cache_engine",
+                    device="CPU",
+                    request_id=req_id,
+                    layer_id=layer_id,
+                    metadata={"segments": len(starts), "location": location},
+                ):
+                    task = next(get_generator)
 
                 assert task is not None
 
@@ -1022,8 +1108,24 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
-                mem_obj_consumer.send(mem_objs_layer)
+                with cf_span(
+                    "cached_kv_cpu_backend_get_wait_layer",
+                    category="cache_engine",
+                    device="CPU",
+                    request_id=req_id,
+                    layer_id=layer_id,
+                    metadata={"segments": len(starts), "location": location},
+                ):
+                    mem_objs_layer = task.result()
+                with cf_span(
+                    "cached_kv_send_to_gpu_connector_layer",
+                    category="cache_engine",
+                    device="CPU->GPU",
+                    request_id=req_id,
+                    layer_id=layer_id,
+                    metadata={"segments": len(starts), "location": location},
+                ):
+                    mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
@@ -1037,7 +1139,13 @@ class LMCacheEngine:
         yield None
 
         # synchronize the last layer
-        next(mem_obj_consumer)
+        with cf_span(
+            "cached_kv_load_finalize",
+            category="cache_engine",
+            device="CPU->GPU",
+            request_id=req_id,
+        ):
+            next(mem_obj_consumer)
 
         # Unpin any disk-loaded staging objects now that the device-side sync
         # has been enqueued (mem_obj_consumer advanced past its sync point).
