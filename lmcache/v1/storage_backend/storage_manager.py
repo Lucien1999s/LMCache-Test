@@ -32,6 +32,8 @@ from lmcache.utils import (
     start_loop_in_thread_with_exceptions,
 )
 from lmcache.v1.config import LMCacheEngineConfig
+# ContextFlow fine-breakdown hooks are disabled unless explicitly enabled.
+from lmcache.v1.contextflow_fine_breakdown import span as cf_fine_span
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -364,9 +366,20 @@ class StorageManager:
         # disk in a similar way as CPU.
         if self.allocator_backend is None:
             raise RuntimeError("Allocator backend not available for scheduler role")
-        return self.allocator_backend.batched_allocate(
-            shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
-        )
+        with cf_fine_span(
+            "storage_manager_batched_allocate",
+            category="storage",
+            device="CPU",
+            metadata={
+                "batch_size": batch_size,
+                "fmt": str(fmt),
+                "eviction": eviction,
+                "busy_loop": busy_loop,
+            },
+        ):
+            return self.allocator_backend.batched_allocate(
+                shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
+            )
 
     def put(
         self,
@@ -396,43 +409,66 @@ class StorageManager:
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
         """
-        # The dictionary from backend cname to objects and keys
-        obj_dict: dict[
-            str,
-            tuple[Sequence[CacheEngineKey], list[MemoryObj]],
-        ] = {}
-        if self.allocator_backend is None:
-            # For scheduler role, no allocator backend available
-            raise RuntimeError("Batched put not available for scheduler role")
-        obj_dict[get_backend_cname(self.allocator_backend)] = (
-            keys,
-            memory_objs,
-        )
+        with cf_fine_span(
+            "storage_manager_batched_put_total",
+            category="storage",
+            device="CPU",
+            metadata={"keys": len(keys), "location": location},
+        ):
+            # The dictionary from backend cname to objects and keys
+            obj_dict: dict[
+                str,
+                tuple[Sequence[CacheEngineKey], list[MemoryObj]],
+            ] = {}
+            if self.allocator_backend is None:
+                # For scheduler role, no allocator backend available
+                raise RuntimeError("Batched put not available for scheduler role")
+            obj_dict[get_backend_cname(self.allocator_backend)] = (
+                keys,
+                memory_objs,
+            )
 
-        for backend_name, backend in self.storage_backends.items():
-            if location and backend_name != location:
-                continue
-            # Skip bypassed backends
-            with self._bypass_lock:
-                if backend_name in self._bypassed_backends:
+            for backend_name, backend in self.storage_backends.items():
+                if location and backend_name != location:
                     continue
+                # Skip bypassed backends
+                with self._bypass_lock:
+                    if backend_name in self._bypassed_backends:
+                        continue
 
-            allocator_backend = backend.get_allocator_backend()
-            cname = get_backend_cname(allocator_backend)
-            if cname not in obj_dict:
-                new_keys, new_objs = allocate_and_copy_objects(
-                    allocator_backend, keys, memory_objs, self.internal_copy_stream
-                )
-                obj_dict[cname] = (new_keys, new_objs)
+                allocator_backend = backend.get_allocator_backend()
+                cname = get_backend_cname(allocator_backend)
+                if cname not in obj_dict:
+                    with cf_fine_span(
+                        "storage_manager_allocate_and_copy_between_backends",
+                        category="storage",
+                        device="CPU/GPU",
+                        metadata={"backend": backend_name, "keys": len(keys)},
+                    ):
+                        new_keys, new_objs = allocate_and_copy_objects(
+                            allocator_backend,
+                            keys,
+                            memory_objs,
+                            self.internal_copy_stream,
+                        )
+                    obj_dict[cname] = (new_keys, new_objs)
 
-            # NOTE: the handling of exists_in_put_tasks
-            # is done in the backend
-            ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+                # NOTE: the handling of exists_in_put_tasks
+                # is done in the backend
+                ks, objs = obj_dict[cname]
+                with cf_fine_span(
+                    "storage_manager_backend_batched_submit_put_task",
+                    category="storage",
+                    device="CPU",
+                    metadata={"backend": backend_name, "keys": len(ks)},
+                ):
+                    backend.batched_submit_put_task(
+                        ks, objs, transfer_spec=transfer_spec
+                    )
 
-        for cname, (ks, objs) in obj_dict.items():
-            for memory_obj in objs:
-                memory_obj.ref_count_down()
+            for cname, (ks, objs) in obj_dict.items():
+                for memory_obj in objs:
+                    memory_obj.ref_count_down()
 
     def get(
         self,
@@ -537,8 +573,16 @@ class StorageManager:
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
             # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
-            task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            with cf_fine_span(
+                "storage_manager_layerwise_batched_get_submit",
+                category="storage",
+                device="CPU",
+                metadata={"location": location, "keys": len(keys_multi_chunk)},
+            ):
+                coro = backend.batched_get_non_blocking(
+                    "fake_lookup_id", keys_multi_chunk
+                )
+                task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 
     def prefetch_single_done_callback(
@@ -909,7 +953,19 @@ class StorageManager:
             # NOTE(Jiayi): We do not pin for PDBackend
             pin_in_backend = pin if backend_name != "PDBackend" else False
 
-            if backend.contains(key, pin_in_backend):
+            with cf_fine_span(
+                "storage_manager_contains_backend",
+                category="storage",
+                device="CPU",
+                metadata={
+                    "backend": backend_name,
+                    "pin": pin_in_backend,
+                    "search_range": search_range,
+                },
+            ):
+                contains_key = backend.contains(key, pin_in_backend)
+
+            if contains_key:
                 return backend_name
 
         return None
@@ -943,7 +999,18 @@ class StorageManager:
             # NOTE(Jiayi): We do not pin for PDBackend
             pin_in_backend = pin if backend_name != "PDBackend" else False
 
-            hit_chunks = backend.batched_contains(keys, pin_in_backend)
+            with cf_fine_span(
+                "storage_manager_batched_contains_backend",
+                category="storage",
+                device="CPU",
+                metadata={
+                    "backend": backend_name,
+                    "keys": len(keys),
+                    "pin": pin_in_backend,
+                    "search_range": search_range,
+                },
+            ):
+                hit_chunks = backend.batched_contains(keys, pin_in_backend)
             if hit_chunks == 0:
                 continue
             block_mapping[backend_name] = keys[:hit_chunks]

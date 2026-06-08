@@ -11,6 +11,8 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
+# ContextFlow fine-breakdown hooks are disabled unless explicitly enabled.
+from lmcache.v1.contextflow_fine_breakdown import span as cf_fine_span
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc.transport import (
@@ -81,7 +83,14 @@ class LMCacheLookupClient(LookupClientInterface):
         None means ongoing; (not supported in sync client)
         int >= 0 means number of hit tokens
         """
-        return self.reqs_status.get(lookup_id, -1)
+        with cf_fine_span(
+            "lookup_client_cache_status_check",
+            category="lookup_client",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={"cached_status_entries": len(self.reqs_status)},
+        ):
+            return self.reqs_status.get(lookup_id, -1)
 
     def lookup(
         self,
@@ -89,24 +98,38 @@ class LMCacheLookupClient(LookupClientInterface):
         lookup_id: str,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
-        request_configs_str = ""
-        if request_configs is not None and len(request_configs) != 0:
-            request_configs_str = json.dumps(request_configs)
+        with cf_fine_span(
+            "lookup_client_prepare_request_configs",
+            category="lookup_client",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={"has_request_configs": bool(request_configs)},
+        ):
+            request_configs_str = ""
+            if request_configs is not None and len(request_configs) != 0:
+                request_configs_str = json.dumps(request_configs)
 
         # NOTE(Jiayi): We cannot only send hashes when
         # blending enabled because the blender need the
         # input embedding.
         if not self.enable_blending:
-            hashes = []
-            offsets = []
+            with cf_fine_span(
+                "lookup_client_prefix_hash_offsets_prepare",
+                category="lookup_client",
+                device="CPU",
+                request_id=lookup_id,
+                metadata={"input_tokens": len(token_ids)},
+            ):
+                hashes = []
+                offsets = []
 
-            for (
-                start,
-                end,
-                key,
-            ) in self.token_database.process_tokens(token_ids, make_key=False):
-                hashes.append(key)
-                offsets.append(end - start)
+                for (
+                    start,
+                    end,
+                    key,
+                ) in self.token_database.process_tokens(token_ids, make_key=False):
+                    hashes.append(key)
+                    offsets.append(end - start)
 
             # if the token database returns no hashes,
             # return 0
@@ -122,25 +145,46 @@ class LMCacheLookupClient(LookupClientInterface):
         else:
             # Convert token_ids to a plain list for msgpack serialization
             # (vLLM 0.18+ may pass ConstantList which msgspec can't encode)
-            if isinstance(token_ids, torch.Tensor):
-                serializable_ids = token_ids.tolist()
-            elif not isinstance(token_ids, list):
-                serializable_ids = list(token_ids)
-            else:
-                serializable_ids = token_ids
+            with cf_fine_span(
+                "lookup_client_segment_token_list_prepare",
+                category="lookup_client",
+                device="CPU",
+                request_id=lookup_id,
+                metadata={"input_tokens": len(token_ids)},
+            ):
+                if isinstance(token_ids, torch.Tensor):
+                    serializable_ids = token_ids.tolist()
+                elif not isinstance(token_ids, list):
+                    serializable_ids = list(token_ids)
+                else:
+                    serializable_ids = token_ids
             msg_buf = [
                 serializable_ids,
                 lookup_id,
                 request_configs_str,
             ]
 
-        responses = self.transport.send_and_recv_all(msg_buf)
+        with cf_fine_span(
+            "lookup_client_transport_send_recv_all",
+            category="lookup_client",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={"world_size": self.transport.world_size},
+        ):
+            responses = self.transport.send_and_recv_all(msg_buf)
 
         # Transport returns empty list on failure
         if not responses:
             return 0
 
-        results = [int.from_bytes(resp, "big") for resp in responses]
+        with cf_fine_span(
+            "lookup_client_result_decode_and_reduce",
+            category="lookup_client",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={"responses": len(responses)},
+        ):
+            results = [int.from_bytes(resp, "big") for resp in responses]
 
         assert len(results) == self.transport.world_size
         if len(set(results)) > 1:
@@ -158,7 +202,14 @@ class LMCacheLookupClient(LookupClientInterface):
         return num_hit_toks
 
     def clear_lookup_status(self, lookup_id: str) -> None:
-        self.reqs_status.pop(lookup_id, None)
+        with cf_fine_span(
+            "lookup_client_clear_lookup_status",
+            category="lookup_client",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={"cached_status_entries": len(self.reqs_status)},
+        ):
+            self.reqs_status.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports

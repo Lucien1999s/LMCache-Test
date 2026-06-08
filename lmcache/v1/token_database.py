@@ -24,6 +24,12 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
+# ContextFlow fine-breakdown hooks are disabled unless explicitly enabled.
+from lmcache.v1.contextflow_fine_breakdown import (
+    is_enabled as cf_fine_is_enabled,
+    record_event as cf_fine_record_event,
+    span as cf_fine_span,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 
 logger = init_logger(__name__)
@@ -372,10 +378,19 @@ class ChunkedTokenDatabase(TokenDatabase):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
-        if mask is not None:
-            num_falses = mask.numel() - mask.long().sum().item()
-        else:
-            num_falses = 0
+        with cf_fine_span(
+            "chunked_token_database_mask_count",
+            category="lookup",
+            device="CPU",
+            metadata={
+                "has_mask": mask is not None,
+                "chunk_size": self.chunk_size,
+            },
+        ):
+            if mask is not None:
+                num_falses = mask.numel() - mask.long().sum().item()
+            else:
+                num_falses = 0
 
         if num_falses % self.chunk_size != 0:
             raise ValueError(
@@ -384,8 +399,22 @@ class ChunkedTokenDatabase(TokenDatabase):
 
         if tokens is not None:
             total_len = len(tokens)
-            token_chunks = self._chunk_tokens(tokens)
-            prefix_hashes = self._prefix_hash(token_chunks)
+            with cf_fine_span(
+                "chunked_token_database_prefix_hash_stream",
+                category="lookup",
+                device="CPU",
+                metadata={
+                    "total_tokens": total_len,
+                    "chunk_size": self.chunk_size,
+                    "make_key": make_key,
+                },
+            ):
+                if cf_fine_is_enabled():
+                    token_chunks = list(self._chunk_tokens(tokens))
+                    prefix_hashes = list(self._prefix_hash(token_chunks))
+                else:
+                    token_chunks = self._chunk_tokens(tokens)
+                    prefix_hashes = self._prefix_hash(token_chunks)
             for chunk_id, hash_val in enumerate(prefix_hashes):
                 start_idx = chunk_id * self.chunk_size
                 end_idx = min(start_idx + self.chunk_size, total_len)
@@ -497,21 +526,60 @@ class SegmentTokenDatabase(TokenDatabase):
         """
 
         if tokens is not None:
-            if not isinstance(tokens, torch.Tensor):
-                tokens = torch.tensor(tokens, dtype=torch.long, device="cpu")
-            else:
-                tokens = tokens.to(device="cpu", dtype=torch.long)
+            with cf_fine_span(
+                "segment_token_database_to_cpu_tensor",
+                category="lookup",
+                device="CPU",
+                metadata={
+                    "input_type": type(tokens).__name__,
+                    "make_key": make_key,
+                    "sep_len": self.sep_len,
+                },
+            ):
+                if not isinstance(tokens, torch.Tensor):
+                    tokens = torch.tensor(tokens, dtype=torch.long, device="cpu")
+                else:
+                    tokens = tokens.to(device="cpu", dtype=torch.long)
 
-            if mask is not None:
-                num_falses = mask.numel() - mask.long().sum().item()
-            else:
-                num_falses = 0
+            with cf_fine_span(
+                "segment_token_database_mask_count",
+                category="lookup",
+                device="CPU",
+                metadata={"has_mask": mask is not None, "total_tokens": len(tokens)},
+            ):
+                if mask is not None:
+                    num_falses = mask.numel() - mask.long().sum().item()
+                else:
+                    num_falses = 0
             assert num_falses < len(tokens), (
                 "The number of Falses in the mask shouldn't "
                 "be less than the length of tokens."
             )
 
-            token_chunks = self._fast_split_by_subtensor(tokens)
+            with cf_fine_span(
+                "segment_token_database_sep_scan_split",
+                category="lookup",
+                device="CPU",
+                metadata={
+                    "total_tokens": len(tokens),
+                    "sep_len": self.sep_len,
+                    "num_falses": int(num_falses),
+                },
+            ):
+                if cf_fine_is_enabled():
+                    token_chunks = list(self._fast_split_by_subtensor(tokens))
+                    cf_fine_record_event(
+                        "segment_token_database_sep_scan_split_result",
+                        category="lookup",
+                        device="CPU",
+                        metadata={
+                            "total_tokens": len(tokens),
+                            "segments": len(token_chunks),
+                            "sep_len": self.sep_len,
+                        },
+                    )
+                else:
+                    token_chunks = self._fast_split_by_subtensor(tokens)
             start_idx = 0
             for idx, token_chunk in enumerate(token_chunks):
                 token_chunk_len = len(token_chunk)
@@ -520,16 +588,27 @@ class SegmentTokenDatabase(TokenDatabase):
                     start_idx += self.sep_len
                     end_idx += self.sep_len
                 if start_idx >= num_falses:
+                    with cf_fine_span(
+                        "segment_token_database_hash_key_construction",
+                        category="lookup",
+                        device="CPU",
+                        metadata={
+                            "segment_index": idx,
+                            "segment_tokens": token_chunk_len,
+                            "start_idx": start_idx,
+                            "end_idx": end_idx,
+                            "make_key": make_key,
+                        },
+                    ):
+                        chunk_hash = self._hash_tokens(token_chunk)
                     if make_key:
                         yield (
                             start_idx,
                             end_idx,
-                            self._make_key_by_hash(
-                                self._hash_tokens(token_chunk), request_configs
-                            ),
+                            self._make_key_by_hash(chunk_hash, request_configs),
                         )
                     else:
-                        yield start_idx, end_idx, self._hash_tokens(token_chunk)
+                        yield start_idx, end_idx, chunk_hash
                 start_idx = end_idx
         elif hashes is not None:
             assert offsets is not None, (

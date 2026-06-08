@@ -16,6 +16,8 @@ from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
+# ContextFlow fine-breakdown hooks are disabled unless explicitly enabled.
+from lmcache.v1.contextflow_fine_breakdown import span as cf_fine_span
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,
@@ -117,21 +119,33 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.__class__.__name__
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        with self.cpu_lock:
-            if key not in self.hot_cache:
-                return False
-            if pin:
-                self.hot_cache[key].pin()
-                # vllm lookup sets pin to True
-                self.keys_in_request.append(key)
-            return True
+        with cf_fine_span(
+            "local_cpu_contains_lock_and_check",
+            category="storage_backend",
+            device="CPU",
+            metadata={"pin": pin, "hot_cache_entries": len(self.hot_cache)},
+        ):
+            with self.cpu_lock:
+                if key not in self.hot_cache:
+                    return False
+                if pin:
+                    self.hot_cache[key].pin()
+                    # vllm lookup sets pin to True
+                    self.keys_in_request.append(key)
+                return True
 
     def touch_cache(self):
         # flip the order of the keys in the request
-        with self.cpu_lock:
-            for key in reversed(self.keys_in_request):
-                self.cache_policy.update_on_hit(key, self.hot_cache)
-            self.keys_in_request = []
+        with cf_fine_span(
+            "local_cpu_touch_cache",
+            category="storage_backend",
+            device="CPU",
+            metadata={"keys_in_request": len(self.keys_in_request)},
+        ):
+            with self.cpu_lock:
+                for key in reversed(self.keys_in_request):
+                    self.cache_policy.update_on_hit(key, self.hot_cache)
+                self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
@@ -152,22 +166,28 @@ class LocalCPUBackend(AllocatorBackendInterface):
             synchronous put completes. Callback exceptions are caught and logged.
         """
         stored = False
-        with self.cpu_lock:
-            if key in self.hot_cache:
-                return None
+        with cf_fine_span(
+            "local_cpu_submit_put_task_lock_and_insert",
+            category="storage_backend",
+            device="CPU",
+            metadata={"hot_cache_entries": len(self.hot_cache)},
+        ):
+            with self.cpu_lock:
+                if key in self.hot_cache:
+                    return None
 
-            memory_obj.ref_count_up()
-            self.hot_cache[key] = memory_obj
+                memory_obj.ref_count_up()
+                self.hot_cache[key] = memory_obj
 
-            self.cache_policy.update_on_put(key)
+                self.cache_policy.update_on_put(key)
 
-            # Push kv admit msg with batching
-            if self.batched_msg_sender is not None:
-                self.batched_msg_sender.add_kv_op(
-                    op_type=OpType.ADMIT,
-                    key=key.chunk_hash,
-                )
-            stored = True
+                # Push kv admit msg with batching
+                if self.batched_msg_sender is not None:
+                    self.batched_msg_sender.add_kv_op(
+                        op_type=OpType.ADMIT,
+                        key=key.chunk_hash,
+                    )
+                stored = True
 
         # Call callback after put completes (outside lock)
         if stored and on_complete_callback is not None:
@@ -191,28 +211,40 @@ class LocalCPUBackend(AllocatorBackendInterface):
         :param on_complete_callback: Optional callback invoked once per key
             after that key's put completes (not once per batch).
         """
-        if not self.use_hot:
-            return
+        with cf_fine_span(
+            "local_cpu_batched_submit_put_task_total",
+            category="storage_backend",
+            device="CPU",
+            metadata={"keys": len(keys), "use_hot": self.use_hot},
+        ):
+            if not self.use_hot:
+                return
 
-        # TODO(Jiayi): optimize this with batching
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
+            # TODO(Jiayi): optimize this with batching
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                self.submit_put_task(
+                    key, memory_obj, on_complete_callback=on_complete_callback
+                )
 
     def get_blocking(
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
-        with self.cpu_lock:
-            if key not in self.hot_cache:
-                return None
-            memory_obj = self.hot_cache[key]
-            # ref count up for caller to avoid situation where the memory_obj
-            # is evicted from the local cpu backend before the caller calls
-            # ref count up themselves
-            memory_obj.ref_count_up()
-            return memory_obj
+        with cf_fine_span(
+            "local_cpu_get_blocking_lock_and_ref",
+            category="storage_backend",
+            device="CPU",
+            metadata={"hot_cache_entries": len(self.hot_cache)},
+        ):
+            with self.cpu_lock:
+                if key not in self.hot_cache:
+                    return None
+                memory_obj = self.hot_cache[key]
+                # ref count up for caller to avoid situation where the memory_obj
+                # is evicted from the local cpu backend before the caller calls
+                # ref count up themselves
+                memory_obj.ref_count_up()
+                return memory_obj
 
     async def batched_get_non_blocking(
         self,
@@ -220,13 +252,20 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
-        mem_objs = []
-        with self.cpu_lock:
-            for key in keys:
-                mem_obj = self.hot_cache[key]
-                mem_obj.ref_count_up()
-                mem_objs.append(mem_obj)
-        return mem_objs
+        with cf_fine_span(
+            "local_cpu_batched_get_non_blocking_lock_and_ref",
+            category="storage_backend",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={"keys": len(keys), "hot_cache_entries": len(self.hot_cache)},
+        ):
+            mem_objs = []
+            with self.cpu_lock:
+                for key in keys:
+                    mem_obj = self.hot_cache[key]
+                    mem_obj.ref_count_up()
+                    mem_objs.append(mem_obj)
+            return mem_objs
 
     async def batched_async_contains(
         self,
@@ -234,18 +273,29 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
-        # NOTE(Jiayi): Only prefix chunks are counted.
-        num_hit_chunks = 0
-        with self.cpu_lock:
-            for key in keys:
-                if key not in self.hot_cache:
-                    return num_hit_chunks
-                if pin:
-                    self.hot_cache[key].pin()
-                    # vllm lookup sets pin to True
-                    self.keys_in_request.append(key)
-                num_hit_chunks += 1
-        return num_hit_chunks
+        with cf_fine_span(
+            "local_cpu_batched_async_contains_lock_and_check",
+            category="storage_backend",
+            device="CPU",
+            request_id=lookup_id,
+            metadata={
+                "keys": len(keys),
+                "pin": pin,
+                "hot_cache_entries": len(self.hot_cache),
+            },
+        ):
+            # NOTE(Jiayi): Only prefix chunks are counted.
+            num_hit_chunks = 0
+            with self.cpu_lock:
+                for key in keys:
+                    if key not in self.hot_cache:
+                        return num_hit_chunks
+                    if pin:
+                        self.hot_cache[key].pin()
+                        # vllm lookup sets pin to True
+                        self.keys_in_request.append(key)
+                    num_hit_chunks += 1
+            return num_hit_chunks
 
     def pin(self, key: CacheEngineKey) -> bool:
         with self.cpu_lock:

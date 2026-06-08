@@ -9,6 +9,8 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
+# ContextFlow fine-breakdown hooks are disabled unless explicitly enabled.
+from lmcache.v1.contextflow_fine_breakdown import span as cf_fine_span
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 
@@ -56,34 +58,51 @@ class LMCacheBypassLookupClient(LookupClientInterface):
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
         try:
-            if not self.enable_blending:
-                # Process tokens to get hashes and offsets
-                hashes = []
-                offsets = []
-                for start, end, key in self.token_database.process_tokens(
-                    token_ids, make_key=False
-                ):
-                    hashes.append(key)
-                    offsets.append(end - start)
-                if not hashes:
-                    return 0
+            with cf_fine_span(
+                "lookup_client_bypass_lookup_total",
+                category="lookup_client",
+                device="CPU",
+                request_id=lookup_id,
+                metadata={
+                    "enable_blending": self.enable_blending,
+                    "input_tokens": len(token_ids),
+                },
+            ):
+                if not self.enable_blending:
+                    with cf_fine_span(
+                        "lookup_client_bypass_prefix_hash_offsets_prepare",
+                        category="lookup_client",
+                        device="CPU",
+                        request_id=lookup_id,
+                        metadata={"input_tokens": len(token_ids)},
+                    ):
+                        # Process tokens to get hashes and offsets
+                        hashes = []
+                        offsets = []
+                        for start, end, key in self.token_database.process_tokens(
+                            token_ids, make_key=False
+                        ):
+                            hashes.append(key)
+                            offsets.append(end - start)
+                    if not hashes:
+                        return 0
 
-                # Call LMCacheEngine lookup with hashes and offsets
-                result = self.lmcache_engine.lookup(
-                    hashes=hashes,
-                    offsets=offsets,
-                    lookup_id=lookup_id,
-                    pin=True,
-                    request_configs=request_configs,
-                )
-            else:
-                # For blending mode, pass tokens directly
-                result = self.lmcache_engine.lookup(
-                    tokens=token_ids,
-                    lookup_id=lookup_id,
-                    pin=True,
-                    request_configs=request_configs,
-                )
+                    # Call LMCacheEngine lookup with hashes and offsets
+                    result = self.lmcache_engine.lookup(
+                        hashes=hashes,
+                        offsets=offsets,
+                        lookup_id=lookup_id,
+                        pin=True,
+                        request_configs=request_configs,
+                    )
+                else:
+                    # For blending mode, pass tokens directly
+                    result = self.lmcache_engine.lookup(
+                        tokens=token_ids,
+                        lookup_id=lookup_id,
+                        pin=True,
+                        request_configs=request_configs,
+                    )
 
             return result
 

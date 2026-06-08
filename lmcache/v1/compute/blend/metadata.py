@@ -27,8 +27,14 @@ class LMCBlendMetadata:
     imp_indices: Optional[torch.Tensor] = None
     attn_mask: Optional[torch.Tensor] = None
     positions: Optional[torch.Tensor] = None
+    slot_mapping: Optional[torch.Tensor] = None
+    block_size: Optional[int] = None
+    request_id: Optional[str] = None
 
     def clean(self):
         self.imp_indices = None
         self.attn_mask = None
         self.positions = None
+        self.slot_mapping = None
+        self.block_size = None
+        self.request_id = None

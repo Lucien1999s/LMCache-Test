@@ -42,6 +42,17 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
+# ContextFlow diagnostics are no-ops unless their explicit experiment flags are set.
+from lmcache.v1.contextflow_profiler import (
+    is_enabled as cf_is_enabled,
+    record_event as cf_record_event,
+    span as cf_span,
+    start_span as cf_start_span,
+)
+from lmcache.v1.contextflow_fine_breakdown import (
+    record_event as cf_fine_record_event,
+    span as cf_fine_span,
+)
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -396,14 +407,27 @@ class ReqMeta:
                 block_size,
             )
 
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
-        )
+        with cf_fine_span(
+            "connector_slot_mapping_construction",
+            category="connector_metadata",
+            device="CPU",
+            request_id=tracker.req_id,
+            metadata={
+                "input_tokens": input_token_len,
+                "tokens_in_mapping": len(token_ids),
+                "num_blocks": num_blocks,
+                "block_size": block_size,
+                "can_load": load_spec.can_load if load_spec is not None else None,
+            },
+        ):
+            block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
+            block_offsets = torch.arange(0, block_size, dtype=torch.long)
+            slot_mapping = (
+                block_offsets.reshape((1, block_size))
+                + block_ids.reshape((num_blocks, 1)) * block_size
+            )
 
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+            slot_mapping = slot_mapping.flatten()[: len(token_ids)]
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
@@ -420,6 +444,29 @@ class ReqMeta:
             # Only compute once (on first batch)
             total_chunks_for_req = math.ceil(tracker.prompt_len / lmcache_chunk_size)
             tracker.disagg_spec.total_chunks = total_chunks_for_req
+
+        cf_fine_record_event(
+            "connector_reqmeta_built",
+            category="connector_metadata",
+            device="CPU",
+            request_id=tracker.req_id,
+            metadata={
+                "input_token_len": input_token_len,
+                "tokens_to_save": num_tokens_to_save,
+                "slot_mapping_len": int(slot_mapping.numel()),
+                "skip_save": skip_save,
+                "save_can_save": save_spec.can_save,
+                "load_can_load": load_spec.can_load if load_spec is not None else None,
+                "lmcache_cached_tokens": (
+                    load_spec.lmcache_cached_tokens
+                    if load_spec is not None
+                    else None
+                ),
+                "vllm_cached_tokens": (
+                    load_spec.vllm_cached_tokens if load_spec is not None else None
+                ),
+            },
+        )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
@@ -530,6 +577,13 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            # ContextFlow-only experiment gate. Defaults to False so regular
+            # LMCache CacheBlend behavior is unchanged.
+            self.contextflow_naive_segment_reuse = bool(
+                config.get_extra_config_value(
+                    "contextflow_naive_segment_reuse", False
+                )
+            )
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -734,6 +788,44 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._manager.post_init()
 
+    def _advance_layerwise_storer(
+        self,
+        layerwise_storer: Generator[Optional[torch.Tensor], None, None],
+        *,
+        stage: str,
+        request_id: str,
+        layer_name: Optional[str] = None,
+    ) -> None:
+        """Advance a layerwise store generator with ContextFlow timing only.
+
+        This preserves the original LMCache behavior: if the generator is
+        unexpectedly exhausted, ``StopIteration`` is still raised.
+        """
+        timer = cf_start_span(
+            stage,
+            category="worker",
+            device="GPU->CPU/CPU",
+            request_id=request_id,
+            metadata={"layer_name": layer_name} if layer_name is not None else None,
+        )
+        try:
+            next(layerwise_storer)
+        except StopIteration:
+            timer.finish(exhausted=True)
+            cf_record_event(
+                f"{stage}_exhausted",
+                category="worker",
+                device="GPU->CPU/CPU",
+                request_id=request_id,
+                metadata={"layer_name": layer_name},
+            )
+            raise
+        except Exception as exc:
+            timer.finish(exception=repr(exc))
+            raise
+        else:
+            timer.finish(exhausted=False)
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -786,47 +878,104 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            with cf_fine_span(
+                "start_load_kv_slot_mapping_to_device",
+                category="worker",
+                device="CPU->GPU",
+                request_id=request.req_id,
+                metadata={
+                    "request_tokens": len(tokens),
+                    "lmcache_cached_tokens": request.load_spec.lmcache_cached_tokens,
+                    "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                },
+            ):
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = request.slot_mapping.to(self.device)
             assert len(tokens) == len(slot_mapping)
 
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
-            masked_token_count = (
-                request.load_spec.vllm_cached_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
-            token_mask[:masked_token_count] = False
+            with cf_fine_span(
+                "start_load_kv_token_mask_construction",
+                category="worker",
+                device="CPU",
+                request_id=request.req_id,
+                metadata={
+                    "request_tokens": len(tokens),
+                    "lmcache_chunk_size": self._lmcache_chunk_size,
+                },
+            ):
+                token_mask = torch.ones(len(tokens), dtype=torch.bool)
+                masked_token_count = (
+                    request.load_spec.vllm_cached_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            tokens_to_load_for_profile = (
+                int(token_mask.sum().item()) if cf_is_enabled() else None
+            )
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
                 else:
                     sync = False
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
-                if self.enable_blending:
+                if self.enable_blending and not self.contextflow_naive_segment_reuse:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    )
+                    with cf_span(
+                        "cacheblend_load_recompute_repair_writeback",
+                        category="worker",
+                        device="CPU/GPU",
+                        request_id=request.req_id,
+                        metadata={
+                            "lmcache_cached_tokens": lmcache_cached_tokens,
+                            "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                            "tokens_to_load": tokens_to_load_for_profile,
+                            "request_tokens": len(tokens),
+                        },
+                    ):
+                        self.blender.blend(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            block_size=self._block_size,
+                            req_id=request.req_id,
+                        )
                 else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        sync=sync,
+                    stage_name = (
+                        "naive_segment_reuse_load_writeback"
+                        if self.enable_blending
+                        else "prefix_chunked_reuse_load_writeback"
                     )
-                    # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
+                    with cf_span(
+                        stage_name,
+                        category="worker",
+                        device="CPU/GPU",
+                        request_id=request.req_id,
+                        metadata={
+                            "lmcache_cached_tokens": lmcache_cached_tokens,
+                            "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                            "tokens_to_load": tokens_to_load_for_profile,
+                            "request_tokens": len(tokens),
+                        },
+                    ):
+                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            block_size=self._block_size,
+                            req_id=request.req_id,
+                            sync=sync,
+                        )
+                        # NOTE: retrieve for two layers at the first layer
+                        next(layerwise_retriever)
+                        next(layerwise_retriever)
+                        self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
@@ -834,6 +983,7 @@ class LMCacheConnectorV1Impl:
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                    block_size=self._block_size,
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                 )
@@ -955,7 +1105,14 @@ class LMCacheConnectorV1Impl:
 
         # Wait for the layer to be loaded
         for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
+            with cf_fine_span(
+                "wait_for_layer_load_retriever_next",
+                category="worker",
+                device="CPU/GPU",
+                layer_id=self.current_layer,
+                metadata={"layer_name": layer_name},
+            ):
+                ret_token_mask = next(layerwise_retriever)
 
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
@@ -1022,8 +1179,15 @@ class LMCacheConnectorV1Impl:
                 assert isinstance(slot_mapping, torch.Tensor)
                 assert len(slot_mapping) == len(token_ids)
 
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.to(self.device)
+                with cf_fine_span(
+                    "save_kv_layer_slot_mapping_to_device",
+                    category="worker",
+                    device="CPU->GPU",
+                    request_id=request.req_id,
+                    metadata={"tokens": len(token_ids), "layer_name": layer_name},
+                ):
+                    # TODO: have a pre-allocated buffer to hold the slot_mappings
+                    slot_mapping = slot_mapping.to(self.device)
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1040,8 +1204,19 @@ class LMCacheConnectorV1Impl:
                         * self._lmcache_chunk_size
                     )
 
-                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
+                with cf_fine_span(
+                    "save_kv_layer_store_mask_construction",
+                    category="worker",
+                    device="CPU",
+                    request_id=request.req_id,
+                    metadata={
+                        "tokens": len(token_ids),
+                        "skip_leading_tokens": skip_leading_tokens,
+                        "layer_name": layer_name,
+                    },
+                ):
+                    store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+                    store_mask[:skip_leading_tokens] = False
 
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
@@ -1054,20 +1229,36 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
-                layerwise_storer = self.lmcache_engine.store_layer(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
-                    sync=is_first,
-                    req_id=request.req_id,
-                )
+                with cf_fine_span(
+                    "save_kv_layer_store_layer_generator_create",
+                    category="worker",
+                    device="CPU",
+                    request_id=request.req_id,
+                    metadata={
+                        "tokens": len(token_ids),
+                        "skip_leading_tokens": skip_leading_tokens,
+                        "layer_name": layer_name,
+                    },
+                ):
+                    layerwise_storer = self.lmcache_engine.store_layer(
+                        token_ids,
+                        mask=store_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping,
+                        offset=skip_leading_tokens,
+                        sync=is_first,
+                        req_id=request.req_id,
+                    )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
                     is_first = False
 
-            next(layerwise_storer)
+            self._advance_layerwise_storer(
+                layerwise_storer,
+                stage="kv_cache_store_layer_step",
+                request_id=request.req_id,
+                layer_name=layer_name,
+            )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -1094,7 +1285,11 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    self._advance_layerwise_storer(
+                        layerwise_storer,
+                        stage="kv_cache_store_finalize",
+                        request_id=request.req_id,
+                    )
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return
@@ -1349,9 +1544,19 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
-        if (
-            num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
-        ) != -1:
+        with cf_span(
+            "later_request_lookup_cache_check",
+            category="scheduler",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "prompt_tokens": request.num_tokens,
+                "vllm_cached_tokens": num_computed_tokens,
+            },
+        ):
+            num_external_hit_tokens = self.lookup_client.lookup_cache(lookup_id=req_id)
+
+        if num_external_hit_tokens != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
             logger.debug(
@@ -1362,27 +1567,48 @@ class LMCacheConnectorV1Impl:
             logger.debug(f"Looking up cache for the first time for request {req_id}!")
             self._requests_priority[req_id] = getattr(request, "priority", 0)
 
-            # token_ids = request.prompt_token_ids
-            # all token ids covers the preemption case
-            token_ids = request.all_token_ids
+            with cf_fine_span(
+                "scheduler_lookup_token_preparation",
+                category="scheduler",
+                device="CPU",
+                request_id=req_id,
+                metadata={
+                    "request_num_tokens": request.num_tokens,
+                    "num_computed_tokens": num_computed_tokens,
+                    "skip_last_n_tokens": self.skip_last_n_tokens,
+                },
+            ):
+                # token_ids = request.prompt_token_ids
+                # all token ids covers the preemption case
+                token_ids = request.all_token_ids
 
-            # If the request has multimodal hashes, apply them to the token ids
-            mm_hashes, mm_positions = extract_mm_features(request)
-            if mm_hashes and mm_positions:
-                # TODO(Jiayi): Optimize this
-                token_ids = torch.tensor(request.prompt_token_ids)
-                apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
-                token_ids = token_ids.tolist()
+                # If the request has multimodal hashes, apply them to the token ids
+                mm_hashes, mm_positions = extract_mm_features(request)
+                if mm_hashes and mm_positions:
+                    # TODO(Jiayi): Optimize this
+                    token_ids = torch.tensor(request.prompt_token_ids)
+                    apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
+                    token_ids = token_ids.tolist()
 
-            request_configs = extract_request_configs(request.sampling_params)
-            if self.skip_last_n_tokens > 0:
-                token_ids = token_ids[: -self.skip_last_n_tokens]
+                request_configs = extract_request_configs(request.sampling_params)
+                if self.skip_last_n_tokens > 0:
+                    token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids,
-                lookup_id=req_id,
-                request_configs=request_configs,
-            )
+            with cf_span(
+                "later_request_cache_lookup",
+                category="scheduler",
+                device="CPU",
+                request_id=req_id,
+                metadata={
+                    "input_tokens": len(token_ids),
+                    "vllm_cached_tokens": num_computed_tokens,
+                },
+            ):
+                num_external_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                )
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1394,21 +1620,32 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
-        # When prompt length is divisible by the block size and all
-        # blocks are cached, we need to recompute the last token.
-        # This will be removed in the future if vLLM's scheduler provides
-        # a better support for this case.
-        need_to_allocate = num_external_hit_tokens - num_computed_tokens
+        with cf_fine_span(
+            "scheduler_load_spec_and_need_to_allocate",
+            category="scheduler",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "prompt_tokens": request.num_tokens,
+                "lmcache_cached_tokens": num_external_hit_tokens,
+                "vllm_cached_tokens": num_computed_tokens,
+            },
+        ):
+            # When prompt length is divisible by the block size and all
+            # blocks are cached, we need to recompute the last token.
+            # This will be removed in the future if vLLM's scheduler provides
+            # a better support for this case.
+            need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
-            need_to_allocate -= 1
+            # In, full-prompt-hit case, we need to recompute the last token
+            if num_external_hit_tokens == request.num_tokens:
+                need_to_allocate -= 1
 
-        # Check if hit tokens meet the minimum for retrieve
-        # If below minimum, skip retrieve but still record hit tokens
-        # for skip_leading_tokens to avoid re-storing existing chunks
-        min_retrieve = self.config.min_retrieve_tokens
-        below_min_retrieve = min_retrieve > 0 and need_to_allocate < min_retrieve
+            # Check if hit tokens meet the minimum for retrieve
+            # If below minimum, skip retrieve but still record hit tokens
+            # for skip_leading_tokens to avoid re-storing existing chunks
+            min_retrieve = self.config.min_retrieve_tokens
+            below_min_retrieve = min_retrieve > 0 and need_to_allocate < min_retrieve
 
         if below_min_retrieve:
             logger.info(
@@ -1439,6 +1676,20 @@ class LMCacheConnectorV1Impl:
             can_load=False,
         )
 
+        cf_record_event(
+            "later_request_cache_lookup_result",
+            category="scheduler",
+            device="CPU",
+            request_id=req_id,
+            metadata={
+                "prompt_tokens": request.num_tokens,
+                "vllm_cached_tokens": num_computed_tokens,
+                "lmcache_cached_tokens": num_external_hit_tokens,
+                "need_to_allocate": max(need_to_allocate, 0),
+                "below_min_retrieve": below_min_retrieve,
+            },
+        )
+
         if below_min_retrieve or need_to_allocate <= 0:
             return 0
 
@@ -1460,7 +1711,14 @@ class LMCacheConnectorV1Impl:
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         assert self.lookup_client is not None
-        self.lookup_client.clear_lookup_status(request.request_id)
+        with cf_fine_span(
+            "scheduler_update_state_after_alloc_clear_lookup_status",
+            category="scheduler",
+            device="CPU",
+            request_id=request.request_id,
+            metadata={"num_external_tokens": num_external_tokens},
+        ):
+            self.lookup_client.clear_lookup_status(request.request_id)
 
         kv_transfer_params = (
             request.kv_transfer_params
@@ -1485,15 +1743,44 @@ class LMCacheConnectorV1Impl:
             )
 
             tmp_disagg_tracker[request.request_id] = disagg_spec
-        self._unfinished_requests[request.request_id] = request
+        with cf_fine_span(
+            "scheduler_update_state_after_alloc_state_update",
+            category="scheduler",
+            device="CPU",
+            request_id=request.request_id,
+            metadata={"num_external_tokens": num_external_tokens},
+        ):
+            self._unfinished_requests[request.request_id] = request
 
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
+            cf_record_event(
+                "kv_slot_allocation_result",
+                category="scheduler",
+                device="CPU",
+                request_id=request.request_id,
+                metadata={
+                    "num_external_tokens": num_external_tokens,
+                    "can_load": False,
+                    "reason": "no_load_spec",
+                },
+            )
             return
 
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            cf_record_event(
+                "kv_slot_allocation_result",
+                category="scheduler",
+                device="CPU",
+                request_id=request.request_id,
+                metadata={
+                    "num_external_tokens": num_external_tokens,
+                    "can_load": False,
+                    "reason": "zero_external_tokens",
+                },
+            )
             return
 
         recalc_last = (
@@ -1521,6 +1808,22 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
+        cf_record_event(
+            "kv_slot_allocation_result",
+            category="scheduler",
+            device="CPU",
+            request_id=request.request_id,
+            metadata={
+                "num_external_tokens": num_external_tokens,
+                "can_load": True,
+                "lmcache_cached_tokens": self.load_specs[
+                    request.request_id
+                ].lmcache_cached_tokens,
+                "vllm_cached_tokens": self.load_specs[
+                    request.request_id
+                ].vllm_cached_tokens,
+            },
+        )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -1540,9 +1843,15 @@ class LMCacheConnectorV1Impl:
 
         meta = LMCacheConnectorMetadata()
 
-        for finished_req_id in scheduler_output.finished_req_ids:
-            self._request_trackers.pop(finished_req_id, None)
-            self._unfinished_requests.pop(finished_req_id, None)
+        with cf_fine_span(
+            "connector_finished_request_cleanup",
+            category="connector_metadata",
+            device="CPU",
+            metadata={"finished_requests": len(scheduler_output.finished_req_ids)},
+        ):
+            for finished_req_id in scheduler_output.finished_req_ids:
+                self._request_trackers.pop(finished_req_id, None)
+                self._unfinished_requests.pop(finished_req_id, None)
 
         # We should load KV for:
         # 1. new requests
@@ -1553,38 +1862,50 @@ class LMCacheConnectorV1Impl:
             # Ignore DP attention mock requests
             if request.req_id.startswith("mock_req"):
                 continue
-            load_spec = self.load_specs.pop(request.req_id, None)
-            num_tokens_to_compute = (
-                request.num_computed_tokens
-                + scheduler_output.num_scheduled_tokens[request.req_id]
-            )
-            lmcache_cached_tokens = 0
-            if load_spec is not None:
-                lmcache_cached_tokens = load_spec.lmcache_cached_tokens
-            request_priority = self._requests_priority.pop(request.req_id, 0)
+            with cf_fine_span(
+                "connector_new_request_tracker_and_reqmeta",
+                category="connector_metadata",
+                device="CPU",
+                request_id=request.req_id,
+                metadata={
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "num_scheduled_tokens": scheduler_output.num_scheduled_tokens[
+                        request.req_id
+                    ],
+                },
+            ):
+                load_spec = self.load_specs.pop(request.req_id, None)
+                num_tokens_to_compute = (
+                    request.num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens[request.req_id]
+                )
+                lmcache_cached_tokens = 0
+                if load_spec is not None:
+                    lmcache_cached_tokens = load_spec.lmcache_cached_tokens
+                request_priority = self._requests_priority.pop(request.req_id, 0)
 
-            skip_save = force_skip_save or (
-                self.config.priority_limit is not None
-                and request_priority > self.config.priority_limit
-            )
+                skip_save = force_skip_save or (
+                    self.config.priority_limit is not None
+                    and request_priority > self.config.priority_limit
+                )
 
-            request_tracker = RequestTracker.from_new_request(
-                self.config,
-                request,
-                num_tokens_to_compute,
-                lmcache_cached_tokens,
-                skip_save,
-            )
-            self._request_trackers[request.req_id] = request_tracker
+                request_tracker = RequestTracker.from_new_request(
+                    self.config,
+                    request,
+                    num_tokens_to_compute,
+                    lmcache_cached_tokens,
+                    skip_save,
+                )
+                self._request_trackers[request.req_id] = request_tracker
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                self._lmcache_chunk_size,
-                load_spec=load_spec,
-                discard_partial_chunks=self._discard_partial_chunks,
-                save_decode_cache=self.config.save_decode_cache,
-            )
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    self._lmcache_chunk_size,
+                    load_spec=load_spec,
+                    discard_partial_chunks=self._discard_partial_chunks,
+                    save_decode_cache=self.config.save_decode_cache,
+                )
             if req_meta is not None:
                 meta.add_request(req_meta)
 
