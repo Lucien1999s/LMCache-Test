@@ -34,7 +34,7 @@ jobs:
     outputs:
       lmcache: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || steps.filter.outputs.lmcache == 'true' }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'push'
         with:
           fetch-depth: 2
@@ -73,7 +73,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # https://github.com/actions/checkout/issues/249
           fetch-depth: 0

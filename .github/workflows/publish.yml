@@ -35,7 +35,7 @@ jobs:
         outputs:
             lmcache: ${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || steps.filter.outputs.lmcache == 'true' }}
         steps:
-            - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
               with:
                 fetch-depth: 2
@@ -314,7 +314,7 @@ jobs:
               uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
             - name: Checkout code
-              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                 # for setuptools-scm
                 fetch-depth: 0
